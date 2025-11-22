@@ -2,13 +2,16 @@ import assert from 'assert';
 import fs from 'fs';
 import path from 'path';
 import { ReportingService } from '../../src/services/ReportingService';
+import { MockAdbClient } from '../mocks/MockAdbClient';
 
 describe('ReportingService', () => {
     let reportingService: ReportingService;
+    let mockAdb: MockAdbClient;
     const flowName = "test_flow";
 
     beforeEach(() => {
-        reportingService = new ReportingService();
+        mockAdb = new MockAdbClient();
+        reportingService = new ReportingService(mockAdb);
     });
 
     afterEach(() => {
@@ -46,5 +49,30 @@ describe('ReportingService', () => {
         assert.ok(content.includes("### Step 1: Open App"));
         assert.ok(content.includes("Action: launch_app -> Success"));
         assert.ok(content.includes("**Status:** PASSED"));
+    });
+
+    it('should retrieve and filter crash logs', async () => {
+        mockAdb.shell = async (cmd) => {
+            if (cmd.includes('logcat')) {
+                return `
+01-01 10:00:00.000 1000 1000 I InfoLog: Not interesting
+01-01 10:00:01.000 1000 1000 E AndroidRuntime:E FATAL EXCEPTION: main
+01-01 10:00:02.000 1000 1000 I flutter: Flutter error caught
+01-01 10:00:03.000 1000 1000 I Other: Something else
+                `.trim();
+            }
+            return "";
+        };
+
+        const logs = await reportingService.getCrashLogs();
+        assert.ok(logs.includes("AndroidRuntime:E FATAL EXCEPTION"), "Should contain fatal exception");
+        assert.ok(logs.includes("flutter: Flutter error caught"), "Should contain flutter error");
+        assert.ok(!logs.includes("InfoLog"), "Should filter out info logs");
+    });
+
+    it('should return message when no crash logs found', async () => {
+         mockAdb.shell = async () => "Just normal logs";
+         const logs = await reportingService.getCrashLogs();
+         assert.ok(logs.includes("No relevant crash logs"), "Should indicate no logs found");
     });
 });

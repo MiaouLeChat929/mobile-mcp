@@ -1,590 +1,333 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolResult } from "@modelcontextprotocol/sdk/types";
-import { z, ZodRawShape, ZodTypeAny } from "zod";
-import fs from "node:fs";
-import os from "node:os";
-import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { z } from "zod";
+import { RealAdbClient } from "./infra/RealAdbClient";
+import { RealFlutterRunner } from "./infra/RealFlutterRunner";
+import { ReleaseEngine } from "./services/ReleaseEngine";
+import { DevEngine } from "./services/DevEngine";
+import { VisionService } from "./services/VisionService";
+import { InteractionService } from "./services/InteractionService";
+import { ReportingService } from "./services/ReportingService";
+import { AdbClient, VmServiceClient } from "./core/interfaces";
 
-import { error, trace } from "./logger";
-import { AndroidRobot, AndroidDeviceManager } from "./android";
-import { ActionableError, Robot } from "./robot";
-import { SimctlManager } from "./iphone-simulator";
-import { IosManager, IosRobot } from "./ios";
-import { PNG } from "./png";
-import { isScalingAvailable, Image } from "./image-utils";
-import { getMobilecliPath } from "./mobilecli";
-
-interface MobilecliDevicesResponse {
-	status: "ok";
-	data: {
-		devices: Array<{
-			id: string;
-			name: string;
-			platform: "android" | "ios";
-			type: "real" | "emulator" | "simulator";
-			version: string;
-		}>;
-	};
+// Mock VmServiceClient for now as we don't have a real implementation in infra yet
+// In a real app, this would be imported from src/infra/RealVmServiceClient
+class NoOpVmServiceClient implements VmServiceClient {
+    async connect(uri: string) {}
+    async disconnect() {}
+    async getRenderObjectDiagnostics(depth: number) { return { type: "Error", error: "Not implemented in this environment" }; }
+    async evaluate(expr: string) { return null; }
 }
 
 export const getAgentVersion = (): string => {
-	const json = require("../package.json");
-	return json.version;
+    try {
+        const json = require("../package.json");
+        return json.version;
+    } catch (e) {
+        return "0.0.1";
+    }
 };
 
-export const createMcpServer = (): McpServer => {
+export interface ServerDependencies {
+    adbClient?: AdbClient;
+    releaseEngine?: ReleaseEngine;
+    devEngine?: DevEngine;
+    visionService?: VisionService;
+    interactionService?: InteractionService;
+    reportingService?: ReportingService;
+}
 
-	const server = new McpServer({
-		name: "mobile-mcp",
-		version: getAgentVersion(),
-		capabilities: {
-			resources: {},
-			tools: {},
-		},
-	});
+export const createMcpServer = (deps: ServerDependencies = {}): McpServer => {
+    const server = new McpServer({
+        name: "flutter-commander",
+        version: getAgentVersion(),
+    });
 
-	// an empty object to satisfy windsurf
-	const noParams = z.object({});
+    // DI Setup
+    const adbClient = deps.adbClient || new RealAdbClient();
+    const releaseEngine = deps.releaseEngine || new ReleaseEngine(adbClient);
+    const devEngine = deps.devEngine || new DevEngine(() => new RealFlutterRunner());
+    const visionService = deps.visionService || new VisionService(adbClient, devEngine, () => new NoOpVmServiceClient());
+    const interactionService = deps.interactionService || new InteractionService(adbClient, visionService);
+    const reportingService = deps.reportingService || new ReportingService();
 
-	const getClientName = (): string => {
-		try {
-			const clientInfo = server.server.getClientVersion();
-			const clientName = clientInfo?.name || "unknown";
-			return clientName;
-		} catch (error: any) {
-			return "unknown";
-		}
-	};
+    // --- Group A: Lifecycle ---
 
-	const tool = (name: string, description: string, paramsSchema: ZodRawShape, cb: (args: z.objectOutputType<ZodRawShape, ZodTypeAny>) => Promise<string>) => {
-		const wrappedCb = async (args: ZodRawShape): Promise<CallToolResult> => {
-			try {
-				trace(`Invoking ${name} with args: ${JSON.stringify(args)}`);
-				const response = await cb(args);
-				trace(`=> ${response}`);
-				posthog("tool_invoked", { "ToolName": name }).then();
-				return {
-					content: [{ type: "text", text: response }],
-				};
-			} catch (error: any) {
-				posthog("tool_failed", { "ToolName": name }).then();
-				if (error instanceof ActionableError) {
-					return {
-						content: [{ type: "text", text: `${error.message}. Please fix the issue and try again.` }],
-					};
-				} else {
-					// a real exception
-					trace(`Tool '${description}' failed: ${error.message} stack: ${error.stack}`);
-					return {
-						content: [{ type: "text", text: `Error: ${error.message}` }],
-						isError: true,
-					};
-				}
-			}
-		};
+    server.tool(
+        "build_app",
+        "Compile the Flutter application (APK).",
+        {
+            mode: z.enum(["debug", "profile"]).default("debug"),
+            target: z.string().default("lib/main.dart").describe("Path to main entry point")
+        },
+        async ({ mode, target }) => {
+            const result = await releaseEngine.buildApp(mode, target);
+            if (result.success) {
+                return { content: [{ type: "text", text: `Build Successful: ${result.apkPath}` }] };
+            } else {
+                return { content: [{ type: "text", text: `Build Failed: ${result.error}` }], isError: true };
+            }
+        }
+    );
 
-		server.tool(name, description, paramsSchema, args => wrappedCb(args));
-	};
+    server.tool(
+        "install_app",
+        "Install the APK via ADB.",
+        {
+            apk_path: z.string(),
+            clean: z.boolean().default(false).describe("Uninstall before installing"),
+            grant_permissions: z.boolean().default(true)
+        },
+        async ({ apk_path, clean, grant_permissions }) => {
+            const res = await releaseEngine.installApp(apk_path, clean, grant_permissions);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-	const posthog = async (event: string, properties: Record<string, string | number>) => {
-		try {
-			const url = "https://us.i.posthog.com/i/v0/e/";
-			const api_key = "phc_KHRTZmkDsU7A8EbydEK8s4lJpPoTDyyBhSlwer694cS";
-			const name = os.hostname() + process.execPath;
-			const distinct_id = crypto.createHash("sha256").update(name).digest("hex");
-			const systemProps: any = {
-				Platform: os.platform(),
-				Product: "mobile-mcp",
-				Version: getAgentVersion(),
-				NodeVersion: process.version,
-			};
+    server.tool(
+        "launch_app",
+        "Launch the application activity.",
+        {
+            package_name: z.string(),
+            wait_for_render: z.boolean().default(true)
+        },
+        async ({ package_name, wait_for_render }) => {
+            const res = await releaseEngine.launchApp(package_name, wait_for_render);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-			const clientName = getClientName();
-			if (clientName !== "unknown") {
-				systemProps.AgentName = clientName;
-			}
+    server.tool(
+        "stop_app",
+        "Force stop the application.",
+        { package_name: z.string() },
+        async ({ package_name }) => {
+            const res = await releaseEngine.stopApp(package_name);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-			await fetch(url, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json"
-				},
-				body: JSON.stringify({
-					api_key,
-					event,
-					properties: {
-						...systemProps,
-						...properties,
-					},
-					distinct_id,
-				})
-			});
-		} catch (err: any) {
-			// ignore
-		}
-	};
+    server.tool(
+        "reset_app_data",
+        "Clear app data and cache.",
+        { package_name: z.string() },
+        async ({ package_name }) => {
+            const res = await releaseEngine.resetAppData(package_name);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-	const getMobilecliVersion = (): string => {
-		try {
-			const path = getMobilecliPath();
-			const output = execFileSync(path, ["--version"], { encoding: "utf8" }).toString().trim();
-			if (output.startsWith("mobilecli version ")) {
-				return output.substring("mobilecli version ".length);
-			}
+    // --- Group B: Dev Session ---
 
-			return "failed";
-		} catch (error: any) {
-			return "failed " + error.message;
-		}
-	};
+    server.tool(
+        "start_dev_session",
+        "Start a 'flutter run --machine' session.",
+        { device_id: z.string() },
+        async ({ device_id }) => {
+            const res = await devEngine.startDevSession(device_id);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-	const getMobilecliDevices = (): MobilecliDevicesResponse => {
-		const mobilecliPath = getMobilecliPath();
-		const mobilecliOutput = execFileSync(mobilecliPath, ["devices"], { encoding: "utf8" }).toString().trim();
-		return JSON.parse(mobilecliOutput) as MobilecliDevicesResponse;
-	};
+    server.tool(
+        "hot_reload",
+        "Trigger Hot Reload.",
+        { reason: z.string().optional() },
+        async ({ reason }) => {
+            const res = await devEngine.hotReload(reason || "agent request");
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-	const mobilecliVersion = getMobilecliVersion();
-	posthog("launch", { "MobilecliVersion": mobilecliVersion }).then();
+    server.tool(
+        "hot_restart",
+        "Trigger Hot Restart.",
+        {},
+        async () => {
+            const res = await devEngine.hotRestart();
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-	const simulatorManager = new SimctlManager();
+    server.tool(
+        "stop_dev_session",
+        "Stop the current flutter process.",
+        {},
+        async () => {
+            const res = await devEngine.stopDevSession();
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-	const getRobotFromDevice = (device: string): Robot => {
-		const iosManager = new IosManager();
-		const androidManager = new AndroidDeviceManager();
-		const simulators = simulatorManager.listBootedSimulators();
-		const androidDevices = androidManager.getConnectedDevices();
-		const iosDevices = iosManager.listDevices();
+    // --- Group C: Vision & Inspection ---
 
-		// Check if it's a simulator
-		const simulator = simulators.find(s => s.name === device);
-		if (simulator) {
-			return simulatorManager.getSimulator(device);
-		}
+    server.tool(
+        "get_semantic_tree",
+        "Get the simplified semantic tree of UI elements.",
+        {},
+        async () => {
+            try {
+                const tree = await visionService.getSemanticTree();
+                return { content: [{ type: "text", text: JSON.stringify(tree, null, 2) }] };
+            } catch (e: any) {
+                return { content: [{ type: "text", text: `Error getting tree: ${e.message}` }], isError: true };
+            }
+        }
+    );
 
-		// Check if it's an Android device
-		const androidDevice = androidDevices.find(d => d.deviceId === device);
-		if (androidDevice) {
-			return new AndroidRobot(device);
-		}
+    server.tool(
+        "find_element",
+        "Wait for an element to appear.",
+        { criteria: z.string(), timeout_ms: z.number().default(5000) },
+        async ({ criteria, timeout_ms }) => {
+            const el = await visionService.findElement(criteria, timeout_ms);
+            if (el) {
+                return { content: [{ type: "text", text: `Found: ${JSON.stringify(el)}` }] };
+            } else {
+                return { content: [{ type: "text", text: "Element not found within timeout" }], isError: true };
+            }
+        }
+    );
 
-		// Check if it's an iOS device
-		const iosDevice = iosDevices.find(d => d.deviceId === device);
-		if (iosDevice) {
-			return new IosRobot(device);
-		}
+    server.tool(
+        "take_screenshot",
+        "Capture current screen state.",
+        {},
+        async () => {
+            const path = await visionService.takeScreenshot();
+            return { content: [{ type: "text", text: `Screenshot saved to: ${path}` }] };
+        }
+    );
 
-		throw new ActionableError(`Device "${device}" not found. Use the mobile_list_available_devices tool to see available devices.`);
-	};
+    server.tool(
+        "analyze_visual_state",
+        "Analyze visual consistency (screenshot + tree).",
+        {},
+        async () => {
+            const res = await visionService.analyzeVisualState();
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-	tool(
-		"mobile_list_available_devices",
-		"List all available devices. This includes both physical devices and simulators. If there is more than one device returned, you need to let the user select one of them.",
-		{
-			noParams
-		},
-		async ({}) => {
-			const iosManager = new IosManager();
-			const androidManager = new AndroidDeviceManager();
-			const simulators = simulatorManager.listBootedSimulators();
-			const simulatorNames = simulators.map(d => d.name);
-			const androidDevices = androidManager.getConnectedDevices();
-			const iosDevices = await iosManager.listDevices();
-			const iosDeviceNames = iosDevices.map(d => d.deviceId);
-			const androidTvDevices = androidDevices.filter(d => d.deviceType === "tv").map(d => d.deviceId);
-			const androidMobileDevices = androidDevices.filter(d => d.deviceType === "mobile").map(d => d.deviceId);
+    // --- Group D: Interaction ---
 
-			if (true) {
-				// gilm: this is new code to verify first that mobilecli detects more or equal number of devices.
-				// in an attempt to make the smoothest transition from go-ios+xcrun+adb+iproxy+sips+imagemagick+wda to
-				// a single cli tool.
-				const deviceCount = simulators.length + iosDevices.length + androidDevices.length;
+    server.tool(
+        "tap_element",
+        "Tap on an element or coordinate.",
+        {
+            finder: z.string().optional(),
+            x: z.number().optional(),
+            y: z.number().optional()
+        },
+        async ({ finder, x, y }) => {
+            let res;
+            if (x !== undefined && y !== undefined) {
+                res = await interactionService.tapElement({ x, y });
+            } else if (finder) {
+                res = await interactionService.tapElement(finder);
+            } else {
+                throw new Error("Must provide either finder or x,y coordinates");
+            }
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-				let mobilecliDeviceCount = 0;
-				try {
-					const response = getMobilecliDevices();
-					if (response.status === "ok" && response.data && response.data.devices) {
-						mobilecliDeviceCount = response.data.devices.length;
-					}
-				} catch (error: any) {
-					// if mobilecli fails, we'll just set count to 0
-				}
+    server.tool(
+        "input_text",
+        "Type text (via ADB).",
+        { text: z.string(), submit: z.boolean().default(false) },
+        async ({ text, submit }) => {
+            const res = await interactionService.inputText(text, submit);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-				if (deviceCount === mobilecliDeviceCount) {
-					posthog("debug_mobilecli_same_number_of_devices", {
-						"DeviceCount": deviceCount,
-						"MobilecliDeviceCount": mobilecliDeviceCount,
-					}).then();
-				} else {
-					posthog("debug_mobilecli_different_number_of_devices", {
-						"DeviceCount": deviceCount,
-						"MobilecliDeviceCount": mobilecliDeviceCount,
-						"DeviceCountDifference": deviceCount - mobilecliDeviceCount,
-					}).then();
-				}
-			}
+    server.tool(
+        "scroll_to",
+        "Scroll in a direction.",
+        { direction: z.enum(["up", "down", "left", "right"]), finder: z.string().optional() },
+        async ({ direction, finder }) => {
+            const res = await interactionService.scrollTo(direction, finder);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-			const resp = ["Found these devices:"];
-			if (simulatorNames.length > 0) {
-				resp.push(`iOS simulators: [${simulatorNames.join(",")}]`);
-			}
+    server.tool(
+        "handle_system_dialog",
+        "Handle native popups.",
+        { action: z.enum(["accept", "deny"]) },
+        async ({ action }) => {
+            const res = await interactionService.handleSystemDialog(action);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-			if (iosDevices.length > 0) {
-				resp.push(`iOS devices: [${iosDeviceNames.join(",")}]`);
-			}
+    server.tool(
+        "inject_file",
+        "Push a file to device.",
+        { source: z.string(), target: z.string() },
+        async ({ source, target }) => {
+            const res = await interactionService.injectFile(source, target);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-			if (androidMobileDevices.length > 0) {
-				resp.push(`Android devices: [${androidMobileDevices.join(",")}]`);
-			}
+    // --- Group E: Reporting ---
 
-			if (androidTvDevices.length > 0) {
-				resp.push(`Android TV devices: [${androidTvDevices.join(",")}]`);
-			}
+    server.tool(
+        "init_test_log",
+        "Initialize a new test report.",
+        { flow_name: z.string() },
+        async ({ flow_name }) => {
+            const res = reportingService.initTestLog(flow_name);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-			return resp.join("\n");
-		}
-	);
+    server.tool(
+        "log_step",
+        "Start a new test step.",
+        { number: z.number(), description: z.string() },
+        async ({ number, description }) => {
+            const res = reportingService.logStep(number, description);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
+    server.tool(
+        "log_action",
+        "Log an action within a step.",
+        {
+            command: z.string(),
+            result: z.string(),
+            level: z.enum(["INFO", "WARN", "ERROR", "DEBUG"]).default("INFO"),
+            screenshot: z.string().optional()
+        },
+        async ({ command, result, level, screenshot }) => {
+            const res = reportingService.logAction(command, result, level, screenshot);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-	tool(
-		"mobile_list_apps",
-		"List all the installed apps on the device",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
-		},
-		async ({ device }) => {
-			const robot = getRobotFromDevice(device);
-			const result = await robot.listApps();
-			return `Found these apps on device: ${result.map(app => `${app.appName} (${app.packageName})`).join(", ")}`;
-		}
-	);
+    server.tool(
+        "finalize_log",
+        "Close the test report.",
+        { status: z.enum(["PASSED", "FAILED"]), summary: z.string() },
+        async ({ status, summary }) => {
+            const res = reportingService.finalizeLog(status, summary);
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-	tool(
-		"mobile_launch_app",
-		"Launch an app on mobile device. Use this to open a specific app. You can find the package name of the app by calling list_apps_on_device.",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			packageName: z.string().describe("The package name of the app to launch"),
-		},
-		async ({ device, packageName }) => {
-			const robot = getRobotFromDevice(device);
-			await robot.launchApp(packageName);
-			return `Launched app ${packageName}`;
-		}
-	);
+    server.tool(
+        "get_crash_logs",
+        "Retrieve recent crash logs.",
+        {},
+        async () => {
+            const res = reportingService.getCrashLogs();
+            return { content: [{ type: "text", text: res }] };
+        }
+    );
 
-	tool(
-		"mobile_terminate_app",
-		"Stop and terminate an app on mobile device",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			packageName: z.string().describe("The package name of the app to terminate"),
-		},
-		async ({ device, packageName }) => {
-			const robot = getRobotFromDevice(device);
-			await robot.terminateApp(packageName);
-			return `Terminated app ${packageName}`;
-		}
-	);
-
-	tool(
-		"mobile_install_app",
-		"Install an app on mobile device",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			path: z.string().describe("The path to the app file to install. For iOS simulators, provide a .zip file or a .app directory. For Android provide an .apk file. For iOS real devices provide an .ipa file"),
-		},
-		async ({ device, path }) => {
-			const robot = getRobotFromDevice(device);
-			await robot.installApp(path);
-			return `Installed app from ${path}`;
-		}
-	);
-
-	tool(
-		"mobile_uninstall_app",
-		"Uninstall an app from mobile device",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			bundle_id: z.string().describe("Bundle identifier (iOS) or package name (Android) of the app to be uninstalled"),
-		},
-		async ({ device, bundle_id }) => {
-			const robot = getRobotFromDevice(device);
-			await robot.uninstallApp(bundle_id);
-			return `Uninstalled app ${bundle_id}`;
-		}
-	);
-
-	tool(
-		"mobile_get_screen_size",
-		"Get the screen size of the mobile device in pixels",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
-		},
-		async ({ device }) => {
-			const robot = getRobotFromDevice(device);
-			const screenSize = await robot.getScreenSize();
-			return `Screen size is ${screenSize.width}x${screenSize.height} pixels`;
-		}
-	);
-
-	tool(
-		"mobile_click_on_screen_at_coordinates",
-		"Click on the screen at given x,y coordinates. If clicking on an element, use the list_elements_on_screen tool to find the coordinates.",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			x: z.number().describe("The x coordinate to click on the screen, in pixels"),
-			y: z.number().describe("The y coordinate to click on the screen, in pixels"),
-		},
-		async ({ device, x, y }) => {
-			const robot = getRobotFromDevice(device);
-			await robot.tap(x, y);
-			return `Clicked on screen at coordinates: ${x}, ${y}`;
-		}
-	);
-
-	tool(
-		"mobile_double_tap_on_screen",
-		"Double-tap on the screen at given x,y coordinates.",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			x: z.number().describe("The x coordinate to double-tap, in pixels"),
-			y: z.number().describe("The y coordinate to double-tap, in pixels"),
-		},
-		async ({ device, x, y }) => {
-			const robot = getRobotFromDevice(device);
-			await robot!.doubleTap(x, y);
-			return `Double-tapped on screen at coordinates: ${x}, ${y}`;
-		}
-	);
-
-	tool(
-		"mobile_long_press_on_screen_at_coordinates",
-		"Long press on the screen at given x,y coordinates. If long pressing on an element, use the list_elements_on_screen tool to find the coordinates.",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			x: z.number().describe("The x coordinate to long press on the screen, in pixels"),
-			y: z.number().describe("The y coordinate to long press on the screen, in pixels"),
-		},
-		async ({ device, x, y }) => {
-			const robot = getRobotFromDevice(device);
-			await robot.longPress(x, y);
-			return `Long pressed on screen at coordinates: ${x}, ${y}`;
-		}
-	);
-
-	tool(
-		"mobile_list_elements_on_screen",
-		"List elements on screen and their coordinates, with display text or accessibility label. Do not cache this result.",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
-		},
-		async ({ device }) => {
-			const robot = getRobotFromDevice(device);
-			const elements = await robot.getElementsOnScreen();
-
-			const result = elements.map(element => {
-				const out: any = {
-					type: element.type,
-					text: element.text,
-					label: element.label,
-					name: element.name,
-					value: element.value,
-					identifier: element.identifier,
-					coordinates: {
-						x: element.rect.x,
-						y: element.rect.y,
-						width: element.rect.width,
-						height: element.rect.height,
-					},
-				};
-
-				if (element.focused) {
-					out.focused = true;
-				}
-
-				return out;
-			});
-
-			return `Found these elements on screen: ${JSON.stringify(result)}`;
-		}
-	);
-
-	tool(
-		"mobile_press_button",
-		"Press a button on device",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			button: z.string().describe("The button to press. Supported buttons: BACK (android only), HOME, VOLUME_UP, VOLUME_DOWN, ENTER, DPAD_CENTER (android tv only), DPAD_UP (android tv only), DPAD_DOWN (android tv only), DPAD_LEFT (android tv only), DPAD_RIGHT (android tv only)"),
-		},
-		async ({ device, button }) => {
-			const robot = getRobotFromDevice(device);
-			await robot.pressButton(button);
-			return `Pressed the button: ${button}`;
-		}
-	);
-
-	tool(
-		"mobile_open_url",
-		"Open a URL in browser on device",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			url: z.string().describe("The URL to open"),
-		},
-		async ({ device, url }) => {
-			const robot = getRobotFromDevice(device);
-			await robot.openUrl(url);
-			return `Opened URL: ${url}`;
-		}
-	);
-
-	tool(
-		"mobile_swipe_on_screen",
-		"Swipe on the screen",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			direction: z.enum(["up", "down", "left", "right"]).describe("The direction to swipe"),
-			x: z.number().optional().describe("The x coordinate to start the swipe from, in pixels. If not provided, uses center of screen"),
-			y: z.number().optional().describe("The y coordinate to start the swipe from, in pixels. If not provided, uses center of screen"),
-			distance: z.number().optional().describe("The distance to swipe in pixels. Defaults to 400 pixels for iOS or 30% of screen dimension for Android"),
-		},
-		async ({ device, direction, x, y, distance }) => {
-			const robot = getRobotFromDevice(device);
-
-			if (x !== undefined && y !== undefined) {
-				// Use coordinate-based swipe
-				await robot.swipeFromCoordinate(x, y, direction, distance);
-				const distanceText = distance ? ` ${distance} pixels` : "";
-				return `Swiped ${direction}${distanceText} from coordinates: ${x}, ${y}`;
-			} else {
-				// Use center-based swipe
-				await robot.swipe(direction);
-				return `Swiped ${direction} on screen`;
-			}
-		}
-	);
-
-	tool(
-		"mobile_type_keys",
-		"Type text into the focused element",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			text: z.string().describe("The text to type"),
-			submit: z.boolean().describe("Whether to submit the text. If true, the text will be submitted as if the user pressed the enter key."),
-		},
-		async ({ device, text, submit }) => {
-			const robot = getRobotFromDevice(device);
-			await robot.sendKeys(text);
-
-			if (submit) {
-				await robot.pressButton("ENTER");
-			}
-
-			return `Typed text: ${text}`;
-		}
-	);
-
-	tool(
-		"mobile_save_screenshot",
-		"Save a screenshot of the mobile device to a file",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			saveTo: z.string().describe("The path to save the screenshot to"),
-		},
-		async ({ device, saveTo }) => {
-			const robot = getRobotFromDevice(device);
-
-			const screenshot = await robot.getScreenshot();
-			fs.writeFileSync(saveTo, screenshot);
-			return `Screenshot saved to: ${saveTo}`;
-		}
-	);
-
-	server.tool(
-		"mobile_take_screenshot",
-		"Take a screenshot of the mobile device. Use this to understand what's on screen, if you need to press an element that is available through view hierarchy then you must list elements on screen instead. Do not cache this result.",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
-		},
-		async ({ device }) => {
-			try {
-				const robot = getRobotFromDevice(device);
-				const screenSize = await robot.getScreenSize();
-
-				let screenshot = await robot.getScreenshot();
-				let mimeType = "image/png";
-
-				// validate we received a png, will throw exception otherwise
-				const image = new PNG(screenshot);
-				const pngSize = image.getDimensions();
-				if (pngSize.width <= 0 || pngSize.height <= 0) {
-					throw new ActionableError("Screenshot is invalid. Please try again.");
-				}
-
-				if (isScalingAvailable()) {
-					trace("Image scaling is available, resizing screenshot");
-					const image = Image.fromBuffer(screenshot);
-					const beforeSize = screenshot.length;
-					screenshot = image.resize(Math.floor(pngSize.width / screenSize.scale))
-						.jpeg({ quality: 75 })
-						.toBuffer();
-
-					const afterSize = screenshot.length;
-					trace(`Screenshot resized from ${beforeSize} bytes to ${afterSize} bytes`);
-
-					mimeType = "image/jpeg";
-				}
-
-				const screenshot64 = screenshot.toString("base64");
-				trace(`Screenshot taken: ${screenshot.length} bytes`);
-				posthog("tool_invoked", {
-					"ToolName": "mobile_take_screenshot",
-					"ScreenshotFilesize": screenshot64.length,
-					"ScreenshotMimeType": mimeType,
-					"ScreenshotWidth": pngSize.width,
-					"ScreenshotHeight": pngSize.height,
-				}).then();
-
-				return {
-					content: [{ type: "image", data: screenshot64, mimeType }]
-				};
-			} catch (err: any) {
-				error(`Error taking screenshot: ${err.message} ${err.stack}`);
-				return {
-					content: [{ type: "text", text: `Error: ${err.message}` }],
-					isError: true,
-				};
-			}
-		}
-	);
-
-	tool(
-		"mobile_set_orientation",
-		"Change the screen orientation of the device",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
-			orientation: z.enum(["portrait", "landscape"]).describe("The desired orientation"),
-		},
-		async ({ device, orientation }) => {
-			const robot = getRobotFromDevice(device);
-			await robot.setOrientation(orientation);
-			return `Changed device orientation to ${orientation}`;
-		}
-	);
-
-	tool(
-		"mobile_get_orientation",
-		"Get the current screen orientation of the device",
-		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
-		},
-		async ({ device }) => {
-			const robot = getRobotFromDevice(device);
-			const orientation = await robot.getOrientation();
-			return `Current device orientation is ${orientation}`;
-		}
-	);
-
-	return server;
+    return server;
 };

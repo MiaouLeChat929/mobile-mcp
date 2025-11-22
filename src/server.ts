@@ -49,7 +49,7 @@ export const createMcpServer = (deps: ServerDependencies = {}): McpServer => {
     const devEngine = deps.devEngine || new DevEngine(() => new RealFlutterRunner());
     const visionService = deps.visionService || new VisionService(adbClient, devEngine, () => new NoOpVmServiceClient());
     const interactionService = deps.interactionService || new InteractionService(adbClient, visionService);
-    const reportingService = deps.reportingService || new ReportingService();
+    const reportingService = deps.reportingService || new ReportingService(adbClient);
 
     // --- Group A: Lifecycle ---
 
@@ -423,7 +423,7 @@ export const createMcpServer = (deps: ServerDependencies = {}): McpServer => {
             inputSchema: {}
         },
         async () => {
-            const res = reportingService.getCrashLogs();
+            const res = await reportingService.getCrashLogs();
             return { content: [{ type: "text", text: res }] };
         }
     );

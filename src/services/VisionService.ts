@@ -2,6 +2,7 @@ import { AdbClient, VmServiceClient } from '../core/interfaces';
 import { DevEngine } from './DevEngine';
 import { SemanticNode, Rect } from '../core/types';
 import fs from 'fs';
+import { XMLParser } from 'fast-xml-parser';
 
 export class VisionService {
   constructor(
@@ -28,27 +29,99 @@ export class VisionService {
   async getSemanticTree(): Promise<SemanticNode> {
     // Strategy:
     // 1. Try to get tree from DevEngine (Flutter Inspector)
-    // 2. If not available, fail or fallback (spec says "Utilise le Flutter DevTools Service")
+    // 2. If not available, fallback to ADB dump (Release Mode / Native)
 
     const runner = this.devEngine.getRunner();
-    if (!runner) {
-        throw new Error("No active Dev Session. Cannot get Semantic Tree via Flutter DevTools.");
-    }
-
     const uri = this.devEngine.getVmServiceUri();
-    if (!uri) {
-        throw new Error("VM Service URI not available yet.");
+
+    if (runner && uri) {
+        const client = this.vmClientFactory();
+        await client.connect(uri);
+
+        try {
+            const rawTree = await client.getRenderObjectDiagnostics(0); // 0 for full tree? or big number.
+            return this.filterIaTree(rawTree);
+        } catch (e) {
+            console.error("Failed to get Flutter tree, falling back to ADB:", e);
+            // Fallthrough to ADB logic below
+        } finally {
+            await client.disconnect();
+        }
     }
 
-    const client = this.vmClientFactory();
-    await client.connect(uri);
+    return this.getReleaseSemanticTree();
+  }
 
-    try {
-        const rawTree = await client.getRenderObjectDiagnostics(0); // 0 for full tree? or big number.
-        return this.filterIaTree(rawTree);
-    } finally {
-        await client.disconnect();
-    }
+  private async getReleaseSemanticTree(): Promise<SemanticNode> {
+      const xml = await this.adb.dumpWindowHierarchy();
+      const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
+      const jsonObj = parser.parse(xml);
+
+      // Root might be hierarchy.node or hierarchy
+      // Depending on fast-xml-parser version and options, accessing the root can vary.
+      // Usually <hierarchy><node ...>...</node></hierarchy>
+      // So jsonObj.hierarchy.node is the root node.
+      const rootNode = jsonObj.hierarchy?.node || jsonObj.node || jsonObj.hierarchy;
+
+      if (!rootNode) {
+          throw new Error("Failed to parse window hierarchy or empty tree.");
+      }
+
+      // If rootNode is an array (rare for root, but possible if multiple roots?), handle it.
+      // But typically hierarchy has one root node.
+      const nodeToProcess = Array.isArray(rootNode) ? rootNode[0] : rootNode;
+
+      return this.xmlNodeToSemanticNode(nodeToProcess);
+  }
+
+  private xmlNodeToSemanticNode(xmlNode: any): SemanticNode {
+      const children: SemanticNode[] = [];
+
+      if (xmlNode.node) {
+          const nodes = Array.isArray(xmlNode.node) ? xmlNode.node : [xmlNode.node];
+          for (const child of nodes) {
+              children.push(this.xmlNodeToSemanticNode(child));
+          }
+      }
+
+      const rect = this.parseBounds(xmlNode.bounds);
+      const type = this.simplifyAndroidType(xmlNode.class);
+      // Use text or content-desc.
+      // Sometimes both exist. Text is visible text, content-desc is for accessibility.
+      // We prefer text, but content-desc is good fallback.
+      const text = xmlNode.text || xmlNode['content-desc'];
+
+      return {
+          type,
+          text: text ? String(text) : undefined,
+          rect,
+          children: children.length > 0 ? children : undefined,
+          isVisible: true, // ADB dump nodes are usually "layout" nodes, visibility is implicit but can be checked via attributes if needed.
+          isClickable: String(xmlNode.clickable) === 'true',
+          isFocusable: String(xmlNode.focusable) === 'true',
+          isFocused: String(xmlNode.focused) === 'true'
+      };
+  }
+
+  private parseBounds(boundsStr: string): Rect {
+      // "[0,0][1080,200]"
+      if (!boundsStr) return { x: 0, y: 0, width: 0, height: 0 };
+
+      const match = boundsStr.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+      if (!match) return { x: 0, y: 0, width: 0, height: 0 };
+
+      const x1 = parseInt(match[1]);
+      const y1 = parseInt(match[2]);
+      const x2 = parseInt(match[3]);
+      const y2 = parseInt(match[4]);
+
+      return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
+  }
+
+  private simplifyAndroidType(rawType: string): string {
+      if (!rawType) return 'Unknown';
+      const parts = rawType.split('.');
+      return parts[parts.length - 1];
   }
 
   // The "IA Filter" logic

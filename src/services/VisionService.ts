@@ -35,7 +35,7 @@ export class VisionService {
         throw new Error("No active Dev Session. Cannot get Semantic Tree via Flutter DevTools.");
     }
 
-    const uri = await runner.getVmServiceUri();
+    const uri = this.devEngine.getVmServiceUri();
     if (!uri) {
         throw new Error("VM Service URI not available yet.");
     }

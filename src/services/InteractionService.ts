@@ -1,6 +1,7 @@
 import { AdbClient } from '../core/interfaces';
 import { VisionService } from './VisionService';
 import { SemanticNode } from '../core/types';
+import { XMLParser } from 'fast-xml-parser';
 
 export class InteractionService {
   constructor(
@@ -52,20 +53,64 @@ export class InteractionService {
   }
 
   async handleSystemDialog(action: 'accept' | 'deny'): Promise<string> {
-      // Heuristic: Look for text "Allow", "Deny", "While using the app" via generic ADB dump if DevTools is blocked?
-      // The spec says "Détecte et gère les popups natifs".
-      // We can use `adb dumpWindowHierarchy` which works even if Flutter is blocked by a native dialog.
       const xml = await this.adb.dumpWindowHierarchy();
-      // Naive parsing
-      if (action === 'accept') {
-          // Look for coordinates of "Allow", "OK", "Yes"
-          // For now, we mock it: assuming we tap the right button.
-          // TODO: Parse XML to find bounds of button with text "Allow"
-          await this.adb.tap(800, 1800); // Mock coordinates
-      } else {
-          await this.adb.tap(200, 1800); // Mock coordinates
+      const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
+      const jsonObj = parser.parse(xml);
+
+      const keywords = action === 'accept'
+          ? ['Allow', 'While using the app', 'OK', 'Yes', 'Accept']
+          : ['Deny', 'Don\'t allow', 'Cancel', 'No'];
+
+      // Depending on parser config, root might be hierarchy.node or just hierarchy
+      const root = jsonObj.hierarchy || jsonObj;
+      const node = this.findNodeByText(root, keywords);
+
+      if (node && node.bounds) {
+          const bounds = this.parseBounds(node.bounds);
+          const x = bounds.x + bounds.width / 2;
+          const y = bounds.y + bounds.height / 2;
+          await this.adb.tap(x, y);
+          return `Handled system dialog: ${action} (Tapped '${node.text || node['content-desc'] || 'Element'}' at ${x},${y})`;
       }
-      return `Handled system dialog: ${action}`;
+
+      throw new Error(`Could not find button for action '${action}' in system dialog`);
+  }
+
+  private findNodeByText(node: any, keywords: string[]): any {
+      const matches: any[] = [];
+      this.collectMatches(node, keywords, matches);
+
+      // Prioritize clickable matches
+      const clickableMatch = matches.find(m => String(m.clickable) === 'true');
+      if (clickableMatch) return clickableMatch;
+
+      return matches[0] || null;
+  }
+
+  private collectMatches(node: any, keywords: string[], matches: any[]) {
+      if (!node) return;
+      const text = node.text || node['content-desc'] || "";
+      if (keywords.some(k => text.includes(k))) {
+          matches.push(node);
+      }
+
+      if (node.node) {
+          const children = Array.isArray(node.node) ? node.node : [node.node];
+          for (const child of children) {
+              this.collectMatches(child, keywords, matches);
+          }
+      }
+  }
+
+  private parseBounds(boundsStr: string): { x: number, y: number, width: number, height: number } {
+      // "[0,0][1080,200]"
+      const match = boundsStr.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+      if (!match) return { x: 0, y: 0, width: 0, height: 0 };
+      const x1 = parseInt(match[1]);
+      const y1 = parseInt(match[2]);
+      const x2 = parseInt(match[3]);
+      const y2 = parseInt(match[4]);
+      return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
   }
 
   async injectFile(sourcePath: string, targetPath: string): Promise<string> {

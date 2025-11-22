@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CallToolResult } from "@modelcontextprotocol/sdk/types";
+import { McpError, ErrorCode, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { RealAdbClient } from "./infra/RealAdbClient";
 import { RealFlutterRunner } from "./infra/RealFlutterRunner";
@@ -51,282 +51,362 @@ export const createMcpServer = (deps: ServerDependencies = {}): McpServer => {
     const interactionService = deps.interactionService || new InteractionService(adbClient, visionService);
     const reportingService = deps.reportingService || new ReportingService();
 
+    // Helper to wrap handlers with error handling
+    const safeHandler = <T>(handler: (args: T) => Promise<any>) => {
+        return async (args: T) => {
+            try {
+                return await handler(args);
+            } catch (err: any) {
+                console.error(`Tool execution error:`, err);
+                // If it's already an McpError, rethrow it
+                if (err instanceof McpError) throw err;
+                // Otherwise wrap it
+                throw new McpError(ErrorCode.InternalError, `Tool failed: ${err.message || String(err)}`);
+            }
+        };
+    };
+
     // --- Group A: Lifecycle ---
 
-    server.tool(
+    server.registerTool(
         "build_app",
-        "Compile the Flutter application (APK).",
         {
-            mode: z.enum(["debug", "profile"]).default("debug"),
-            target: z.string().default("lib/main.dart").describe("Path to main entry point")
+            title: "Build App",
+            description: "Compile the Flutter application (APK).",
+            inputSchema: {
+                mode: z.enum(["debug", "profile"]).default("debug"),
+                target: z.string().default("lib/main.dart").describe("Path to main entry point")
+            }
         },
-        async ({ mode, target }) => {
+        safeHandler(async ({ mode, target }) => {
             const result = await releaseEngine.buildApp(mode, target);
             if (result.success) {
                 return { content: [{ type: "text", text: `Build Successful: ${result.apkPath}` }] };
             } else {
                 return { content: [{ type: "text", text: `Build Failed: ${result.error}` }], isError: true };
             }
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "install_app",
-        "Install the APK via ADB.",
         {
-            apk_path: z.string(),
-            clean: z.boolean().default(false).describe("Uninstall before installing"),
-            grant_permissions: z.boolean().default(true)
+            title: "Install App",
+            description: "Install the APK via ADB.",
+            inputSchema: {
+                apk_path: z.string(),
+                clean: z.boolean().default(false).describe("Uninstall before installing"),
+                grant_permissions: z.boolean().default(true)
+            }
         },
-        async ({ apk_path, clean, grant_permissions }) => {
+        safeHandler(async ({ apk_path, clean, grant_permissions }) => {
             const res = await releaseEngine.installApp(apk_path, clean, grant_permissions);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "launch_app",
-        "Launch the application activity.",
         {
-            package_name: z.string(),
-            wait_for_render: z.boolean().default(true)
+            title: "Launch App",
+            description: "Launch the application activity.",
+            inputSchema: {
+                package_name: z.string(),
+                wait_for_render: z.boolean().default(true)
+            }
         },
-        async ({ package_name, wait_for_render }) => {
+        safeHandler(async ({ package_name, wait_for_render }) => {
             const res = await releaseEngine.launchApp(package_name, wait_for_render);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "stop_app",
-        "Force stop the application.",
-        { package_name: z.string() },
-        async ({ package_name }) => {
+        {
+            title: "Stop App",
+            description: "Force stop the application.",
+            inputSchema: { package_name: z.string() }
+        },
+        safeHandler(async ({ package_name }) => {
             const res = await releaseEngine.stopApp(package_name);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "reset_app_data",
-        "Clear app data and cache.",
-        { package_name: z.string() },
-        async ({ package_name }) => {
+        {
+            title: "Reset App Data",
+            description: "Clear app data and cache.",
+            inputSchema: { package_name: z.string() }
+        },
+        safeHandler(async ({ package_name }) => {
             const res = await releaseEngine.resetAppData(package_name);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
     // --- Group B: Dev Session ---
 
-    server.tool(
+    server.registerTool(
         "start_dev_session",
-        "Start a 'flutter run --machine' session.",
-        { device_id: z.string() },
-        async ({ device_id }) => {
+        {
+            title: "Start Dev Session",
+            description: "Start a 'flutter run --machine' session.",
+            inputSchema: { device_id: z.string() }
+        },
+        safeHandler(async ({ device_id }) => {
             const res = await devEngine.startDevSession(device_id);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "hot_reload",
-        "Trigger Hot Reload.",
-        { reason: z.string().optional() },
-        async ({ reason }) => {
+        {
+            title: "Hot Reload",
+            description: "Trigger Hot Reload.",
+            inputSchema: { reason: z.string().optional() }
+        },
+        safeHandler(async ({ reason }) => {
             const res = await devEngine.hotReload(reason || "agent request");
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "hot_restart",
-        "Trigger Hot Restart.",
-        {},
-        async () => {
+        {
+            title: "Hot Restart",
+            description: "Trigger Hot Restart.",
+            inputSchema: {}
+        },
+        safeHandler(async () => {
             const res = await devEngine.hotRestart();
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "stop_dev_session",
-        "Stop the current flutter process.",
-        {},
-        async () => {
+        {
+            title: "Stop Dev Session",
+            description: "Stop the current flutter process.",
+            inputSchema: {}
+        },
+        safeHandler(async () => {
             const res = await devEngine.stopDevSession();
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
     // --- Group C: Vision & Inspection ---
 
-    server.tool(
+    server.registerTool(
         "get_semantic_tree",
-        "Get the simplified semantic tree of UI elements.",
-        {},
-        async () => {
-            try {
-                const tree = await visionService.getSemanticTree();
-                return { content: [{ type: "text", text: JSON.stringify(tree, null, 2) }] };
-            } catch (e: any) {
-                return { content: [{ type: "text", text: `Error getting tree: ${e.message}` }], isError: true };
-            }
-        }
+        {
+            title: "Get Semantic Tree",
+            description: "Get the simplified semantic tree of UI elements.",
+            inputSchema: {}
+        },
+        safeHandler(async () => {
+            const tree = await visionService.getSemanticTree();
+            return { content: [{ type: "text", text: JSON.stringify(tree, null, 2) }] };
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "find_element",
-        "Wait for an element to appear.",
-        { criteria: z.string(), timeout_ms: z.number().default(5000) },
-        async ({ criteria, timeout_ms }) => {
+        {
+            title: "Find Element",
+            description: "Wait for an element to appear.",
+            inputSchema: { criteria: z.string(), timeout_ms: z.number().default(5000) }
+        },
+        safeHandler(async ({ criteria, timeout_ms }) => {
             const el = await visionService.findElement(criteria, timeout_ms);
             if (el) {
                 return { content: [{ type: "text", text: `Found: ${JSON.stringify(el)}` }] };
             } else {
                 return { content: [{ type: "text", text: "Element not found within timeout" }], isError: true };
             }
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "take_screenshot",
-        "Capture current screen state.",
-        {},
-        async () => {
+        {
+            title: "Take Screenshot",
+            description: "Capture current screen state.",
+            inputSchema: {}
+        },
+        safeHandler(async () => {
             const path = await visionService.takeScreenshot();
             return { content: [{ type: "text", text: `Screenshot saved to: ${path}` }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "analyze_visual_state",
-        "Analyze visual consistency (screenshot + tree).",
-        {},
-        async () => {
+        {
+            title: "Analyze Visual State",
+            description: "Analyze visual consistency (screenshot + tree).",
+            inputSchema: {}
+        },
+        safeHandler(async () => {
             const res = await visionService.analyzeVisualState();
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
     // --- Group D: Interaction ---
 
-    server.tool(
+    server.registerTool(
         "tap_element",
-        "Tap on an element or coordinate.",
         {
-            finder: z.string().optional(),
-            x: z.number().optional(),
-            y: z.number().optional()
+            title: "Tap Element",
+            description: "Tap on an element or coordinate.",
+            inputSchema: {
+                finder: z.string().optional(),
+                x: z.number().optional(),
+                y: z.number().optional()
+            }
         },
-        async ({ finder, x, y }) => {
+        safeHandler(async ({ finder, x, y }) => {
             let res;
             if (x !== undefined && y !== undefined) {
                 res = await interactionService.tapElement({ x, y });
             } else if (finder) {
                 res = await interactionService.tapElement(finder);
             } else {
-                throw new Error("Must provide either finder or x,y coordinates");
+                throw new McpError(ErrorCode.InvalidParams, "Must provide either finder or x,y coordinates");
             }
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "input_text",
-        "Type text (via ADB).",
-        { text: z.string(), submit: z.boolean().default(false) },
-        async ({ text, submit }) => {
+        {
+            title: "Input Text",
+            description: "Type text (via ADB).",
+            inputSchema: { text: z.string(), submit: z.boolean().default(false) }
+        },
+        safeHandler(async ({ text, submit }) => {
             const res = await interactionService.inputText(text, submit);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "scroll_to",
-        "Scroll in a direction.",
-        { direction: z.enum(["up", "down", "left", "right"]), finder: z.string().optional() },
-        async ({ direction, finder }) => {
+        {
+            title: "Scroll To",
+            description: "Scroll in a direction.",
+            inputSchema: { direction: z.enum(["up", "down", "left", "right"]), finder: z.string().optional() }
+        },
+        safeHandler(async ({ direction, finder }) => {
             const res = await interactionService.scrollTo(direction, finder);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "handle_system_dialog",
-        "Handle native popups.",
-        { action: z.enum(["accept", "deny"]) },
-        async ({ action }) => {
+        {
+            title: "Handle System Dialog",
+            description: "Handle native popups.",
+            inputSchema: { action: z.enum(["accept", "deny"]) }
+        },
+        safeHandler(async ({ action }) => {
             const res = await interactionService.handleSystemDialog(action);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "inject_file",
-        "Push a file to device.",
-        { source: z.string(), target: z.string() },
-        async ({ source, target }) => {
+        {
+            title: "Inject File",
+            description: "Push a file to device.",
+            inputSchema: { source: z.string(), target: z.string() }
+        },
+        safeHandler(async ({ source, target }) => {
             const res = await interactionService.injectFile(source, target);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
     // --- Group E: Reporting ---
 
-    server.tool(
+    server.registerTool(
         "init_test_log",
-        "Initialize a new test report.",
-        { flow_name: z.string() },
-        async ({ flow_name }) => {
+        {
+            title: "Init Test Log",
+            description: "Initialize a new test report.",
+            inputSchema: { flow_name: z.string() }
+        },
+        safeHandler(async ({ flow_name }) => {
             const res = reportingService.initTestLog(flow_name);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "log_step",
-        "Start a new test step.",
-        { number: z.number(), description: z.string() },
-        async ({ number, description }) => {
+        {
+            title: "Log Step",
+            description: "Start a new test step.",
+            inputSchema: { number: z.number(), description: z.string() }
+        },
+        safeHandler(async ({ number, description }) => {
             const res = reportingService.logStep(number, description);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "log_action",
-        "Log an action within a step.",
         {
-            command: z.string(),
-            result: z.string(),
-            level: z.enum(["INFO", "WARN", "ERROR", "DEBUG"]).default("INFO"),
-            screenshot: z.string().optional()
+            title: "Log Action",
+            description: "Log an action within a step.",
+            inputSchema: {
+                command: z.string(),
+                result: z.string(),
+                level: z.enum(["INFO", "WARN", "ERROR", "DEBUG"]).default("INFO"),
+                screenshot: z.string().optional()
+            }
         },
-        async ({ command, result, level, screenshot }) => {
+        safeHandler(async ({ command, result, level, screenshot }) => {
             const res = reportingService.logAction(command, result, level, screenshot);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "finalize_log",
-        "Close the test report.",
-        { status: z.enum(["PASSED", "FAILED"]), summary: z.string() },
-        async ({ status, summary }) => {
+        {
+            title: "Finalize Log",
+            description: "Close the test report.",
+            inputSchema: { status: z.enum(["PASSED", "FAILED"]), summary: z.string() }
+        },
+        safeHandler(async ({ status, summary }) => {
             const res = reportingService.finalizeLog(status, summary);
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
-    server.tool(
+    server.registerTool(
         "get_crash_logs",
-        "Retrieve recent crash logs.",
-        {},
-        async () => {
+        {
+            title: "Get Crash Logs",
+            description: "Retrieve recent crash logs.",
+            inputSchema: {}
+        },
+        safeHandler(async () => {
             const res = reportingService.getCrashLogs();
             return { content: [{ type: "text", text: res }] };
-        }
+        })
     );
 
     return server;

@@ -4,6 +4,7 @@ import { Readable } from 'stream';
 export class DevEngine {
   private currentProcess: FlutterRunner | null = null;
   private deviceId: string | null = null;
+  private vmServiceUri: string | null = null;
 
   constructor(private runnerFactory: () => FlutterRunner) {}
 
@@ -13,6 +14,7 @@ export class DevEngine {
     }
 
     this.deviceId = deviceId;
+    this.vmServiceUri = null;
     this.currentProcess = this.runnerFactory();
 
     // Start flutter run --machine
@@ -35,7 +37,6 @@ export class DevEngine {
           this.handleFlutterEvent(event);
         } catch (e) {
           // Not JSON, maybe raw text
-          // console.log("Raw flutter output:", line);
         }
       }
     });
@@ -44,7 +45,7 @@ export class DevEngine {
   private handleFlutterEvent(event: any) {
     if (event.event === 'app.debugPort') {
        // Store WS URI for VisionService
-       // console.log("VM Service available at:", event.params.wsUri);
+       this.vmServiceUri = event.params.wsUri;
     }
     // Handle other events like app.started, etc.
   }
@@ -74,5 +75,9 @@ export class DevEngine {
   // Expose the runner so VisionService can get the VM Service URI
   public getRunner(): FlutterRunner | null {
     return this.currentProcess;
+  }
+
+  public getVmServiceUri(): string | null {
+    return this.vmServiceUri;
   }
 }

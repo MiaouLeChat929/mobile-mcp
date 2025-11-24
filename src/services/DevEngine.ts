@@ -28,15 +28,31 @@ export class DevEngine {
   }
 
   private setupStreamListeners(stream: Readable) {
+    let buffer = '';
+    const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
+
     stream.on('data', (chunk) => {
-      const lines = chunk.toString().split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const event = JSON.parse(line);
-          this.handleFlutterEvent(event);
-        } catch (e) {
-          // Not JSON, maybe raw text
+      buffer += chunk.toString();
+
+      // Safety check for runaway buffer
+      if (buffer.length > MAX_BUFFER_SIZE) {
+        console.error('DevEngine: Buffer exceeded 1MB, clearing to prevent memory leak.');
+        buffer = ''; // Discard buffer. This might lose a frame, but protects the process.
+        return;
+      }
+
+      let newlineIndex;
+      while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.substring(0, newlineIndex);
+        buffer = buffer.substring(newlineIndex + 1);
+
+        if (line.trim()) {
+            try {
+                const event = JSON.parse(line);
+                this.handleFlutterEvent(event);
+            } catch (e) {
+                // Not JSON, maybe raw text
+            }
         }
       }
     });

@@ -1,12 +1,15 @@
 import fs from 'fs';
 import path from 'path';
 import { LogStep, LogEntry } from '../core/types';
+import { AdbClient } from '../core/interfaces';
 
 export class ReportingService {
   private currentFlowName: string | null = null;
   private logFilePath: string | null = null;
   private steps: LogStep[] = [];
   private startTime: number = 0;
+
+  constructor(private adb?: AdbClient) {}
 
   initTestLog(flowName: string): string {
     this.currentFlowName = flowName;
@@ -56,10 +59,32 @@ export class ReportingService {
     return `Log finalized: ${status}`;
   }
 
-  getCrashLogs(): string {
-      // In a real scenario, this would run `adb logcat -d` and filter for Dart/Flutter exceptions.
-      // For now, we return a placeholder or a mock command.
-      return "No crash logs found (Not implemented fully in this iteration)";
+  async getCrashLogs(): Promise<string> {
+      if (!this.adb) {
+          return "ADB Client not available for crash logs.";
+      }
+      try {
+          // Dump last 500 lines
+          const logs = await this.adb.shell('logcat -d -t 500');
+          return this.filterLogs(logs);
+      } catch (e: any) {
+          return `Failed to retrieve logs: ${e.message}`;
+      }
+  }
+
+  private filterLogs(rawLogs: string): string {
+      const lines = rawLogs.split('\n');
+      const filtered = lines.filter(line =>
+          line.includes('AndroidRuntime:E') ||
+          line.includes('FATAL EXCEPTION') ||
+          line.includes('flutter:')
+      );
+
+      if (filtered.length === 0) {
+          return "No relevant crash logs (AndroidRuntime:E, FATAL EXCEPTION, flutter:) found in the last 500 lines.";
+      }
+
+      return filtered.join('\n');
   }
 
   private flushLog(finalStatus: 'PENDING' | 'PASSED' | 'FAILED' = 'PENDING', summary?: string) {

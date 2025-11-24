@@ -63,4 +63,30 @@ describe('VisionService', () => {
         assert.ok(found, "Should find element with text 'Scan Button'");
         assert.strictEqual(found?.text, "Scan Button");
     });
+
+    it('should fallback to ADB dumpWindowHierarchy when no Dev Session is active', async () => {
+        // Create a new DevEngine with no session
+        const emptyDevEngine = new DevEngine(() => new MockFlutterRunner());
+        // Do NOT start session
+
+        // Override ADB dump for this test
+        mockAdb.dumpWindowHierarchy = async () => `
+            <hierarchy rotation="0">
+                <node index="0" text="" class="android.widget.FrameLayout" bounds="[0,0][1080,2400]">
+                    <node index="0" text="Native Button" class="android.widget.Button" clickable="true" bounds="[100,100][300,200]" />
+                </node>
+            </hierarchy>
+        `;
+
+        const fallbackVision = new VisionService(mockAdb, emptyDevEngine, () => mockVmClient);
+
+        const tree = await fallbackVision.getSemanticTree();
+
+        assert.ok(tree, "Tree should be returned from ADB");
+        assert.strictEqual(tree.type, "FrameLayout");
+        assert.strictEqual(tree.children?.length, 1);
+        assert.strictEqual(tree.children?.[0].type, "Button");
+        assert.strictEqual(tree.children?.[0].text, "Native Button");
+        assert.deepStrictEqual(tree.children?.[0].rect, { x: 100, y: 100, width: 200, height: 100 });
+    });
 });

@@ -3,6 +3,7 @@ import { FlutterRunner } from '../../src/core/interfaces';
 import { Readable, PassThrough } from 'stream';
 import assert from 'assert';
 
+// Local mock to allow fine-grained stream control for these specific tests
 class MockFlutterRunner implements FlutterRunner {
   public stdout = new PassThrough();
   public stderr = new PassThrough();
@@ -28,16 +29,17 @@ describe('DevEngine Stream Parsing', () => {
   it('should parse VM Service URI from split chunks', async () => {
     await devEngine.startDevSession('test-device');
 
+    // Simulate a JSON packet split across two TCP chunks
     const part1 = '{"event":"app.debugPort","params":{"wsUri":"ws://127.0.0.1:1234/ws"}}'.substring(0, 20);
     const part2 = '{"event":"app.debugPort","params":{"wsUri":"ws://127.0.0.1:1234/ws"}}'.substring(20) + '\n';
 
     mockRunner.stdout.write(part1);
     mockRunner.stdout.write(part2);
 
-    // Give it a moment to process
+    // Give the event loop a moment to process
     await new Promise(resolve => setTimeout(resolve, 50));
 
-    assert.strictEqual(devEngine.vmServiceUri, "ws://127.0.0.1:1234/ws");
+    assert.strictEqual(devEngine.getVmServiceUri(), "ws://127.0.0.1:1234/ws");
   });
 
   it('should handle multiple lines in one chunk', async () => {
@@ -50,27 +52,22 @@ describe('DevEngine Stream Parsing', () => {
 
     await new Promise(resolve => setTimeout(resolve, 50));
 
-    assert.strictEqual(devEngine.vmServiceUri, "ws://valid");
+    assert.strictEqual(devEngine.getVmServiceUri(), "ws://valid");
   });
 
   it('should handle buffer cleaning to prevent memory leaks', async () => {
     await devEngine.startDevSession('test-device');
 
-    // Write a huge chunk without newline
+    // Write a huge chunk without newline to trigger the safety valve
     const hugeChunk = 'a'.repeat(1024 * 1024 + 10); // > 1MB
     mockRunner.stdout.write(hugeChunk);
-
-    // This logic depends on internal implementation details (clearing buffer),
-    // but externally we can verify it doesn't crash and subsequent messages work.
 
     const validLine = JSON.stringify({ event: 'app.debugPort', params: { wsUri: 'ws://recovered' } }) + '\n';
     mockRunner.stdout.write(validLine);
 
     await new Promise(resolve => setTimeout(resolve, 50));
 
-    // If buffer was cleared, we should process the new valid line.
-    // Note: In a naive implementation, 'recovered' might be appended to 'aaaa...', making it invalid JSON.
-    // So if this passes, it means the buffer was indeed reset or handled gracefully.
-    assert.strictEqual(devEngine.vmServiceUri, "ws://recovered");
+    // If buffer was cleared, we should successfully process the new valid line
+    assert.strictEqual(devEngine.getVmServiceUri(), "ws://recovered");
   });
 });

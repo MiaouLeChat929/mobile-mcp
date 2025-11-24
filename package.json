@@ -28,6 +28,7 @@
     "commander": "14.0.0",
     "express": "5.1.0",
     "fast-xml-parser": "5.2.5",
+    "ws": "^8.18.3",
     "zod-to-json-schema": "3.24.6"
   },
   "optionalDependencies": {
@@ -41,6 +42,7 @@
     "@types/express": "^5.0.3",
     "@types/mocha": "^10.0.10",
     "@types/node": "^22.13.10",
+    "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.28.0",
     "@typescript-eslint/parser": "^8.26.1",
     "@typescript-eslint/utils": "^8.26.1",

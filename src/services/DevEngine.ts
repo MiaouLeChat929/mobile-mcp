@@ -4,6 +4,7 @@ import { Readable } from 'stream';
 export class DevEngine {
   private currentProcess: FlutterRunner | null = null;
   private deviceId: string | null = null;
+  public vmServiceUri: string | null = null;
 
   constructor(private runnerFactory: () => FlutterRunner) {}
 
@@ -14,6 +15,7 @@ export class DevEngine {
 
     this.deviceId = deviceId;
     this.currentProcess = this.runnerFactory();
+    this.vmServiceUri = null;
 
     // Start flutter run --machine
     await this.currentProcess.spawn(['run', '--machine', '-d', deviceId]);
@@ -26,16 +28,32 @@ export class DevEngine {
   }
 
   private setupStreamListeners(stream: Readable) {
+    let buffer = '';
+    const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
+
     stream.on('data', (chunk) => {
-      const lines = chunk.toString().split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const event = JSON.parse(line);
-          this.handleFlutterEvent(event);
-        } catch (e) {
-          // Not JSON, maybe raw text
-          // console.log("Raw flutter output:", line);
+      buffer += chunk.toString();
+
+      // Safety check for runaway buffer
+      if (buffer.length > MAX_BUFFER_SIZE) {
+        console.error('DevEngine: Buffer exceeded 1MB, clearing to prevent memory leak.');
+        buffer = ''; // Discard buffer. This might lose a frame, but protects the process.
+        return;
+      }
+
+      let newlineIndex;
+      while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.substring(0, newlineIndex);
+        buffer = buffer.substring(newlineIndex + 1);
+
+        if (line.trim()) {
+            try {
+                const event = JSON.parse(line);
+                this.handleFlutterEvent(event);
+            } catch (e) {
+                // Not JSON, maybe raw text
+                // console.log("Raw flutter output:", line);
+            }
         }
       }
     });
@@ -44,6 +62,7 @@ export class DevEngine {
   private handleFlutterEvent(event: any) {
     if (event.event === 'app.debugPort') {
        // Store WS URI for VisionService
+       this.vmServiceUri = event.params.wsUri;
        // console.log("VM Service available at:", event.params.wsUri);
     }
     // Handle other events like app.started, etc.

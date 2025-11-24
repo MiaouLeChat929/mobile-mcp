@@ -3,21 +3,13 @@ import { CallToolResult } from "@modelcontextprotocol/sdk/types";
 import { z } from "zod";
 import { RealAdbClient } from "./infra/RealAdbClient";
 import { RealFlutterRunner } from "./infra/RealFlutterRunner";
+import { RealVmServiceClient } from "./infra/RealVmServiceClient";
 import { ReleaseEngine } from "./services/ReleaseEngine";
 import { DevEngine } from "./services/DevEngine";
 import { VisionService } from "./services/VisionService";
 import { InteractionService } from "./services/InteractionService";
 import { ReportingService } from "./services/ReportingService";
 import { AdbClient, VmServiceClient } from "./core/interfaces";
-
-// Mock VmServiceClient for now as we don't have a real implementation in infra yet
-// In a real app, this would be imported from src/infra/RealVmServiceClient
-class NoOpVmServiceClient implements VmServiceClient {
-    async connect(uri: string) {}
-    async disconnect() {}
-    async getRenderObjectDiagnostics(depth: number) { return { type: "Error", error: "Not implemented in this environment" }; }
-    async evaluate(expr: string) { return null; }
-}
 
 export const getAgentVersion = (): string => {
     try {
@@ -47,7 +39,7 @@ export const createMcpServer = (deps: ServerDependencies = {}): McpServer => {
     const adbClient = deps.adbClient || new RealAdbClient();
     const releaseEngine = deps.releaseEngine || new ReleaseEngine(adbClient);
     const devEngine = deps.devEngine || new DevEngine(() => new RealFlutterRunner());
-    const visionService = deps.visionService || new VisionService(adbClient, devEngine, () => new NoOpVmServiceClient());
+    const visionService = deps.visionService || new VisionService(adbClient, devEngine, () => new RealVmServiceClient());
     const interactionService = deps.interactionService || new InteractionService(adbClient, visionService);
     const reportingService = deps.reportingService || new ReportingService();
 
